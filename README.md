@@ -58,85 +58,122 @@ docker exec myjenkins cat /var/jenkins_home/secrets/initialAdminPassword
 - 이 파이프라인은 Checkout, Build, Artifact 저장 단계를 수행하며 Gradle과 Maven 프로젝트를 자동으로 감지.
 
 ```
+// Jenkinsfile
 pipeline {
-    agent any
+    agent any // 어떤 Jenkins 에이전트에서든 이 파이프라인을 실행합니다.
 
-    // GitHub Webhook이 푸시 이벤트를 감지하면 파이프라인을 트리거 함.
+    // GitHub Push가 발생하면 자동으로 빌드를 시작하는 Webhook 트리거입니다.
     triggers { githubPush() }
 
-    options {
-        timestamps()
-        ansiColor('xterm')
-    }
-
+    // 파이프라인 전체에서 사용할 환경 변수를 정의합니다.
     environment {
-        GITHUB_REPO   = 'https://github.com/kohtaewoo/fisatest.git' // GitHub 저장소 주소
-        BRANCH_NAME   = 'main'                                     // 타겟 브랜치
-        PROJECT_PATH  = 'step03_JPAGradle'                         // 빌드할 서브프로젝트 경로
-        WORKSPACE_DIR = "${env.WORKSPACE}"                         // Jenkins 워크스페이스 경로
+        // 1. GitHub 설정
+        GITHUB_REPO   = 'https://github.com/kohtaewoo/fisatest.git' // 본인의 GitHub 저장소 URL로 변경하세요.
+        BRANCH_NAME   = 'main'                                       // 사용할 브랜치 이름입니다.
+        PROJECT_PATH  = 'step03_JPAGradle'                           // Git 저장소 내의 실제 프로젝트 디렉토리 이름입니다.
+
+        // 2. 배포 대상 서버(myserver02) 정보
+        // myserver02의 IP 주소 또는 호스트 이름을 정확하게 입력하세요.
+        // Jenkins 컨테이너에서 접근 가능한 IP여야 합니다.
+        DEPLOY_HOST   = 'ubuntu@10.0.2.20'
+        
+        // myserver02에 애플리케이션을 배포할 경로와 systemd 서비스 이름입니다.
+        APP_DIR       = '/opt/step03/app'
+        SERVICE       = 'step03' 
+        
+        // 3. Jenkins SSH Credentials ID
+        // Jenkins에 등록한 'SSH Username with private key' Credential의 ID입니다.
+        SSH_CREDENTIAL_ID = 'myserver02-ssh-key' 
     }
 
     stages {
+        // Stage 1: 소스 코드 가져오기
         stage('Checkout') {
             steps {
-                echo "Checking out ${BRANCH_NAME} branch from ${GITHUB_REPO}"
                 git branch: "${BRANCH_NAME}", url: "${GITHUB_REPO}"
-                sh "echo '--- Contents of ${PROJECT_PATH} ---'; ls -al ${PROJECT_PATH}"
+                echo "Source code checkout successful from ${BRANCH_NAME} branch."
+                sh "ls -al ${PROJECT_PATH}"
             }
         }
 
+        // Stage 2: 프로젝트 빌드 (Gradle 또는 Maven)
         stage('Build') {
             steps {
                 script {
-                    // gradlew 파일 존재 여부로 Gradle 프로젝트인지 확인
                     if (fileExists("${PROJECT_PATH}/gradlew")) {
                         echo "Gradle project detected. Starting build..."
                         dir("${PROJECT_PATH}") {
                             sh 'chmod +x gradlew'
-                            sh './gradlew clean build -x test' // 테스트는 제외하고 빌드
+                            sh './gradlew clean build -x test'
                         }
-                    // pom.xml 파일로 Maven 프로젝트인지 확인
                     } else if (fileExists("${PROJECT_PATH}/pom.xml")) {
                         echo "Maven project detected. Starting build..."
                         dir("${PROJECT_PATH}") {
                             sh 'mvn -B -DskipTests clean package'
                         }
                     } else {
-                        error "Build failed: No gradlew or pom.xml found in ${PROJECT_PATH}"
+                        error "Build failed: Neither gradlew nor pom.xml found."
+                    }
+                    echo "Build successful."
+                }
+            }
+        }
+
+        // Stage 3: 빌드 결과물(JAR 파일) 확인
+        stage('Verify Artifact') {
+            steps {
+                echo "Verifying created artifacts..."
+                sh "ls -al ${PROJECT_PATH}/build/libs/ || true"
+                sh "ls -al ${PROJECT_PATH}/target/ || true"
+            }
+        }
+
+        // Stage 4: myserver02로 배포 및 애플리케이션 재시작
+        stage('Deploy') {
+            steps {
+                sshagent(credentials: [SSH_CREDENTIAL_ID]) {
+                    script {
+                        // ==========================================================
+                        // === 수정된 부분: '-plain.jar' 파일을 제외하고 하나의 JAR만 선택 ===
+                        // ==========================================================
+                        def jarFile = sh(script: "find ${PROJECT_PATH}/build/libs/ -name '*.jar' | grep -v -- '-plain.jar' || find ${PROJECT_PATH}/target/ -name '*.jar'", returnStdout: true).trim()
+
+                        if (jarFile.isEmpty()) {
+                            error "Deploy failed: JAR file not found."
+                        }
+
+                        echo "Deploying ${jarFile} to ${DEPLOY_HOST}..."
+
+                        sh """
+                            # 1. myserver02에 배포 디렉토리가 없으면 생성합니다.
+                            ssh -o StrictHostKeyChecking=no ${DEPLOY_HOST} 'sudo mkdir -p ${APP_DIR}'
+
+                            # 2. 빌드된 JAR 파일을 myserver02의 임시 경로로 복사합니다.
+                            scp -o StrictHostKeyChecking=no "${jarFile}" ${DEPLOY_HOST}:/tmp/app.jar
+
+                            # 3. 임시 경로의 JAR 파일을 최종 배포 경로로 옮기고 권한을 설정합니다.
+                            ssh -o StrictHostKeyChecking=no ${DEPLOY_HOST} 'sudo mv /tmp/app.jar ${APP_DIR}/app.jar && sudo chown ubuntu:ubuntu ${APP_DIR}/app.jar'
+
+                            # 4. myserver02에 등록된 systemd 서비스를 재시작하고 상태를 확인합니다.
+                            ssh -o StrictHostKeyChecking=no ${DEPLOY_HOST} 'sudo systemctl restart ${SERVICE} && sleep 3 && sudo systemctl status ${SERVICE} --no-pager'
+                        """
                     }
                 }
             }
-            post {
-                success {
-                    // 빌드 성공 시 산출물을 아카이브하여 Jenkins 빌드 페이지에서 다운로드할 수 있도록 함
-                    archiveArtifacts artifacts: "${PROJECT_PATH}/build/libs/*.jar, ${PROJECT_PATH}/target/*.jar",
-                                   allowEmptyArchive: true, fingerprint: true
-                }
-            }
-        }
-
-        stage('Save Artifact') {
-            steps {
-                script {
-                    echo "Copying artifact to workspace root for easy access from host."
-                    // Gradle 산출물을 워크스페이스 루트로 복사
-                    sh "cp ${PROJECT_PATH}/build/libs/*.jar ${WORKSPACE_DIR}/ || true"
-                    // Maven 산출물을 워크스페이스 루트로 복사
-                    sh "cp ${PROJECT_PATH}/target/*.jar ${WORKSPACE_DIR}/ || true"
-                }
-            }
         }
     }
 
+    // 파이프라인 실행 후 처리
     post {
         success {
-            echo "✅ Build successful! Artifact is available at host path: /srv/jenkins/workspace/${env.JOB_NAME}/"
+            echo "Pipeline successful! Deployment to ${DEPLOY_HOST} is complete."
         }
         failure {
-            echo '❌ Build failed. Please check the console log for details.'
+            echo "Pipeline failed. Please check the console output for errors."
         }
     }
 }
+
 ```
 
 ### 4. GitHub Webhook 연동
